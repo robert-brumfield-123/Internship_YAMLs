@@ -1,0 +1,297 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Reliable scanning lab: Ubuntu attacker (nmap) + metasploitable-like + 3 Ubuntu targets. No SG egress."
+
+Parameters:
+  AttackerInstanceType:
+    Type: String
+    Default: t3.xlarge
+
+  TargetInstanceType:
+    Type: String
+    Default: t2.micro
+
+  AttackerSshIngressCidr:
+    Type: String
+    Default: "0.0.0.0/0"
+Resources:
+  LabVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.80.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref LabVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref LabVPC
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  AttackerSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LabVPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: 10.80.1.0/24
+      MapPublicIpOnLaunch: true
+
+  TargetSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LabVPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: 10.80.2.0/24
+      MapPublicIpOnLaunch: true
+
+  AttackerAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref AttackerSubnet
+      RouteTableId: !Ref RouteTable
+
+  TargetAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref TargetSubnet
+      RouteTableId: !Ref RouteTable
+
+  AttackerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Attacker SSH access"
+      VpcId: !Ref LabVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AttackerSshIngressCidr
+
+  TargetASG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Metasploitable-like target (all ports from attacker)"
+      VpcId: !Ref LabVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 0
+          ToPort: 65535
+          SourceSecurityGroupId: !Ref AttackerSG
+        - IpProtocol: udp
+          FromPort: 0
+          ToPort: 65535
+          SourceSecurityGroupId: !Ref AttackerSG
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          SourceSecurityGroupId: !Ref AttackerSG
+
+  TargetBSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Web server"
+      VpcId: !Ref LabVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AttackerSG
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref AttackerSG
+
+  TargetCSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "FTP server"
+      VpcId: !Ref LabVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 21
+          ToPort: 21
+          SourceSecurityGroupId: !Ref AttackerSG
+
+  TargetDSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "SMB server"
+      VpcId: !Ref LabVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 139
+          ToPort: 139
+          SourceSecurityGroupId: !Ref AttackerSG
+        - IpProtocol: tcp
+          FromPort: 445
+          ToPort: 445
+          SourceSecurityGroupId: !Ref AttackerSG
+
+  Attacker:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub "{{resolve:ssm:/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id}}"
+      InstanceType: !Ref AttackerInstanceType
+      SubnetId: !Ref AttackerSubnet
+      SecurityGroupIds: [!Ref AttackerSG]
+      Tags:
+        - Key: Name
+          Value: attacker-nmap
+      UserData:
+        Fn::Base64: |
+          #!/usr/bin/env bash
+          set -euxo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+
+          apt-get update -y
+          apt-get install -y --no-install-recommends nmap net-tools dnsutils curl git hydra nikto openssh-server
+
+          # Create student login
+          id -u student >/dev/null 2>&1 || useradd -m -s /bin/bash student
+          echo "student:student" | chpasswd
+          usermod -aG sudo student || true
+
+          # Force SSH password login
+          SSHD=/etc/ssh/sshd_config
+
+          # Ensure these keys exist and are set correctly
+          sed -i 's/^\s*#\?\s*PasswordAuthentication\s\+.*/PasswordAuthentication yes/' $SSHD || true
+          grep -q '^PasswordAuthentication ' $SSHD || echo 'PasswordAuthentication yes' >> $SSHD
+
+          sed -i 's/^\s*#\?\s*KbdInteractiveAuthentication\s\+.*/KbdInteractiveAuthentication yes/' $SSHD || true
+          grep -q '^KbdInteractiveAuthentication ' $SSHD || echo 'KbdInteractiveAuthentication yes' >> $SSHD
+
+          sed -i 's/^\s*#\?\s*ChallengeResponseAuthentication\s\+.*/ChallengeResponseAuthentication yes/' $SSHD || true
+          grep -q '^ChallengeResponseAuthentication ' $SSHD || echo 'ChallengeResponseAuthentication yes' >> $SSHD
+
+          sed -i 's/^\s*#\?\s*UsePAM\s\+.*/UsePAM yes/' $SSHD || true
+          grep -q '^UsePAM ' $SSHD || echo 'UsePAM yes' >> $SSHD
+
+          sed -i 's/^\s*#\?\s*PermitRootLogin\s\+.*/PermitRootLogin no/' $SSHD || true
+          grep -q '^PermitRootLogin ' $SSHD || echo 'PermitRootLogin no' >> $SSHD
+
+          # IMPORTANT: remove any AuthenticationMethods lines that can force publickey-only
+          sed -i '/^\s*AuthenticationMethods\s\+/d' $SSHD || true
+
+          # Force password auth via sshd_config.d (overrides cloud-init defaults)
+          cat >/etc/ssh/sshd_config.d/99-scanlab.conf <<'EOF'
+          PasswordAuthentication yes
+          KbdInteractiveAuthentication yes
+          ChallengeResponseAuthentication yes
+          UsePAM yes
+          EOF
+
+          # Remove any AuthenticationMethods that could force publickey-only
+          sed -i '/^\s*AuthenticationMethods\s\+/d' /etc/ssh/sshd_config || true
+          sed -i '/^\s*AuthenticationMethods\s\+/d' /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true
+
+          systemctl restart ssh || systemctl restart sshd || true
+
+          # Restart SSH
+          systemctl enable --now ssh
+          systemctl restart ssh
+
+          echo "OK: student/student enabled for SSH passwords" > /root/ssh-password-enabled.txt
+          echo "Login: ssh student@<public-ip>  password: student" > /etc/motd
+         
+  TargetA:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub "{{resolve:ssm:/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id}}"
+      InstanceType: !Ref TargetInstanceType
+      SubnetId: !Ref TargetSubnet
+      SecurityGroupIds: [!Ref TargetASG]
+      Tags:
+        - Key: Name
+          Value: target-1
+      UserData:
+        Fn::Base64: |
+          #!/usr/bin/env bash
+          set -eux
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y
+          apt-get install -y openssh-server apache2 php mariadb-server vsftpd samba xinetd inetutils-telnetd
+          systemctl enable --now ssh apache2 mariadb vsftpd smbd nmbd xinetd || true
+
+  TargetB:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub "{{resolve:ssm:/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id}}"
+      InstanceType: !Ref TargetInstanceType
+      SubnetId: !Ref TargetSubnet
+      SecurityGroupIds: [!Ref TargetBSG]
+      Tags:
+        - Key: Name
+          Value: target-2
+      UserData:
+        Fn::Base64: |
+          #!/usr/bin/env bash
+          set -eux
+          apt-get update -y
+          apt-get install -y apache2
+          systemctl enable --now apache2
+
+  TargetC:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub "{{resolve:ssm:/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id}}"
+      InstanceType: !Ref TargetInstanceType
+      SubnetId: !Ref TargetSubnet
+      SecurityGroupIds: [!Ref TargetCSG]
+      Tags:
+        - Key: Name
+          Value: target-3
+      UserData:
+        Fn::Base64: |
+          #!/usr/bin/env bash
+          set -eux
+          apt-get update -y
+          apt-get install -y vsftpd
+          systemctl enable --now vsftpd
+
+  TargetD:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub "{{resolve:ssm:/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id}}"
+      InstanceType: !Ref TargetInstanceType
+      SubnetId: !Ref TargetSubnet
+      SecurityGroupIds: [!Ref TargetDSG]
+      Tags:
+        - Key: Name
+          Value: target-4
+      UserData:
+        Fn::Base64: |
+          #!/usr/bin/env bash
+          set -eux
+          apt-get update -y
+          apt-get install -y samba
+          systemctl enable --now smbd nmbd
+
+Outputs:
+  AttackerPublicIP:
+    Value: !GetAtt Attacker.PublicIp
+  AttackerPrivateIP:
+    Value: !GetAtt Attacker.PrivateIp
+  TargetAIP:
+    Value: !GetAtt TargetA.PrivateIp
+  TargetBIP:
+    Value: !GetAtt TargetB.PrivateIp
+  TargetCIP:
+    Value: !GetAtt TargetC.PrivateIp
+  TargetDIP:
+    Value: !GetAtt TargetD.PrivateIp

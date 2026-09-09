@@ -1,0 +1,212 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Metasploitable-2-like Ubuntu target (creates VPC+subnets). No SecurityGroupEgress."
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues: [t3.micro, t3.small, t3.medium, t3.large]
+
+  KeyName:
+    Type: String
+    Default: ""
+    Description: "Optional EC2 key pair name (leave blank if not needed)"
+
+Conditions:
+  UseKeyPair: !Not [!Equals [!Ref KeyName, ""]]
+
+Resources:
+  LabVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.50.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: vocareum-msf2like-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref LabVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref LabVPC
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  # Two subnets (keeps your earlier plan intact, even if this template only launches the target)
+  AttackerSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LabVPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: 10.50.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: attacker-subnet
+
+  TargetSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref LabVPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: 10.50.2.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: target-subnet
+
+  AttackerSubnetAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref AttackerSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  TargetSubnetAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref TargetSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  TargetSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Metasploitable-like target: allow all ports from within VPC only"
+      VpcId: !Ref LabVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: !GetAtt LabVPC.CidrBlock
+        - IpProtocol: udp
+          FromPort: 0
+          ToPort: 65535
+          CidrIp: !GetAtt LabVPC.CidrBlock
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: !GetAtt LabVPC.CidrBlock
+
+  TargetInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub "{{resolve:ssm:/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id}}"
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref TargetSubnet
+      SecurityGroupIds:
+        - !Ref TargetSecurityGroup
+      KeyName: !If [UseKeyPair, !Ref KeyName, !Ref "AWS::NoValue"]
+      Tags:
+        - Key: Name
+          Value: metasploitable-like-target
+      UserData:
+        Fn::Base64: |
+          #!/usr/bin/env bash
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+
+          apt-get update -y
+          apt-get install -y --no-install-recommends \
+            openssh-server \
+            apache2 php libapache2-mod-php php-mysqli \
+            mariadb-server \
+            vsftpd \
+            xinetd inetutils-telnetd \
+            samba \
+            tomcat9 \
+            git curl unzip
+
+          # Weak user like Metasploitable2
+          if ! id -u msfadmin >/dev/null 2>&1; then
+            useradd -m -s /bin/bash msfadmin
+          fi
+          echo "msfadmin:msfadmin" | chpasswd
+          usermod -aG sudo msfadmin || true
+
+          # SSH password auth (intentionally weak)
+          sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          systemctl enable --now ssh
+
+          # vsftpd: anonymous + write (intentionally unsafe)
+          cp /etc/vsftpd.conf /etc/vsftpd.conf.bak || true
+          sed -i 's/^#\?anonymous_enable=.*/anonymous_enable=YES/' /etc/vsftpd.conf
+          sed -i 's/^#\?local_enable=.*/local_enable=YES/' /etc/vsftpd.conf
+          sed -i 's/^#\?write_enable=.*/write_enable=YES/' /etc/vsftpd.conf
+          sed -i 's/^#\?anon_upload_enable=.*/anon_upload_enable=YES/' /etc/vsftpd.conf
+          sed -i 's/^#\?anon_mkdir_write_enable=.*/anon_mkdir_write_enable=YES/' /etc/vsftpd.conf
+          mkdir -p /srv/ftp/upload
+          chmod 777 /srv/ftp/upload
+          systemctl enable --now vsftpd
+
+          # Telnet via xinetd (intentionally unsafe)
+          cat >/etc/xinetd.d/telnet <<'EOF'
+          service telnet
+          {
+            disable         = no
+            flags           = REUSE
+            socket_type     = stream
+            wait            = no
+            user            = root
+            server          = /usr/sbin/in.telnetd
+          }
+          EOF
+          systemctl enable --now xinetd
+
+          # Samba: world-writable guest share (intentionally unsafe)
+          cp /etc/samba/smb.conf /etc/samba/smb.conf.bak || true
+          mkdir -p /srv/samba/share
+          chmod 777 /srv/samba/share
+          cat >>/etc/samba/smb.conf <<'EOF'
+
+          [vulnshare]
+            path = /srv/samba/share
+            browsable = yes
+            writable = yes
+            guest ok = yes
+            read only = no
+            force user = nobody
+          EOF
+          systemctl enable --now smbd nmbd
+
+          # MariaDB: weak root password + DVWA DB/user
+          systemctl enable --now mariadb
+          mysql -u root <<'SQL'
+          ALTER USER 'root'@'localhost' IDENTIFIED BY 'root';
+          FLUSH PRIVILEGES;
+          CREATE DATABASE IF NOT EXISTS dvwa;
+          CREATE USER IF NOT EXISTS 'dvwa'@'localhost' IDENTIFIED BY 'dvwa';
+          GRANT ALL PRIVILEGES ON dvwa.* TO 'dvwa'@'localhost';
+          FLUSH PRIVILEGES;
+          SQL
+
+          # DVWA
+          if [ ! -d /var/www/html/dvwa ]; then
+            git clone --depth 1 https://github.com/digininja/DVWA.git /var/www/html/dvwa
+            chown -R www-data:www-data /var/www/html/dvwa
+          fi
+          a2enmod rewrite >/dev/null 2>&1 || true
+          systemctl enable --now apache2
+          systemctl enable --now tomcat9
+
+Outputs:
+  TargetPrivateIp:
+    Description: "Target private IP (attack from Kali in the same lab session)"
+    Value: !GetAtt TargetInstance.PrivateIp
+
+  VpcId:
+    Value: !Ref LabVPC
