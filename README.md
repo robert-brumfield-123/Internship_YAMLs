@@ -82,15 +82,14 @@ authorization to test.
 
 This is a diagram showing the architecture that is created by the nmap_lab.template file.
 
-                    AWS VPC
-              10.50.0.0/16
-                     |
-          +----------+----------+
-          |                     |
-   Attacker Subnet        Target Subnet
-    10.50.1.0/24          10.50.2.0/24
-          |                     |
-     Kali Linux          +------+------+------+
-                         |      |      |      |
-                       Target Target Target Target
-                         A      B      C      D
+                     AWS VPC
+                  10.80.0.0/16
+                         |
+              +----------+----------+
+              |                     |
+       Attacker Subnet        Target Subnet
+        10.80.1.0/24          10.80.2.0/24
+              |                     |
+       Attacker VM            +------+------+------+
+       attacker-nmap          |      |      |      |
+                            target-1 target-2 target-3 target-4
